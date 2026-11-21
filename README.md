@@ -58,6 +58,7 @@ Not linked as skills: names starting with `_` or `.`, `codex` and `codex-worker`
 
 - The usage figures are as of the last Codex turn on this machine, which is when they change. Usage from another device appears after your next local turn. A window whose reset has passed shows as "reset since the last reading (assumed unused)" and counts as full for `--min-left`, though another device may have used it since; a window without a numeric `used_percent` is ignored.
 - Codex runs with its sandbox on: `read-only` for questions and reviews, `workspace-write` (the job's folder plus temp folders such as `/tmp`) for images and small edits. The answer file (`-o`) is written by the CLI itself, so the skill gives it a fresh path. The skill never turns the sandbox off.
+- The CLI inside an editor extension runs jobs (`codex exec`) but not the interactive screen: `codex` alone stops with "this CLI has no complete local package". `codex --no-daemon` opens it; to trust hooks with `/hooks` comfortably, install the full CLI (`brew install --cask codex`). It uses the same login.
 - Codex's CLI has no video generation.
 - The log format was read from Codex CLI 0.171 (November 2026). If a later version changes it, `codex-usage` reports "no usage reading" instead of guessing.
 - Several Claude accounts? [claude-swap](https://github.com/realiti4/claude-swap) switches between them and shows their usage in the macOS menu bar.
