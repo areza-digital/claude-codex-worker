@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+"""How much of your Codex (ChatGPT plan) usage is left, without spending any.
+
+Codex CLI writes a session log to $CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl
+(CODEX_HOME defaults to ~/.codex). After every turn it appends an event like
+
+  {"type":"event_msg","payload":{"type":"token_count","rate_limits":{
+     "limit_id":"codex","plan_type":"plus",
+     "primary":{"used_percent":42.0,"window_minutes":300,"resets_at":1700018000},
+     "secondary":{"used_percent":7.0,"window_minutes":10080,"resets_at":1700604800}}}}
+
+(seen in Codex CLI 0.171.0-alpha.13, November 2026). This script reads the newest
+such event from the end of the newest logs. It opens no credentials, makes no
+network call and runs no model. The figures are as of the last Codex turn on this
+machine, which is when they change; usage from another device shows up only after
+your next local turn. A window whose reset time has passed is shown as "reset since
+the last reading (assumed unused)" and counts as 100 % left; a window without a numeric
+used_percent is ignored, and with no usable window there is no reading (exit 1).
+
+  codex-usage                 human summary
+  codex-usage --json          one JSON object
+  codex-usage --min-left 20   exit 3 if either window has less than 20 % left
+  codex-usage --selftest      check the parser
+
+Exit codes: 0 ok, 1 no reading, 2 bad arguments, 3 under the --min-left floor.
+"""
+import argparse
+import glob
+import json
+import math
+import os
+import sys
+import time
+from datetime import datetime
+
+CHUNK = 64 * 1024
+MAX_SCAN = 8 * 1024 * 1024  # bytes read from the end of one log before giving up on it
+MAX_FILES = 5
+
+
+def codex_home():
+    return os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+
+
+def newest_logs(home, limit=MAX_FILES):
+    days = sorted(glob.glob(os.path.join(home, "sessions", "*", "*", "*")), reverse=True)[:3]
+    files = [f for d in days for f in glob.glob(os.path.join(d, "*.jsonl"))]
+    return sorted(files, key=os.path.getmtime, reverse=True)[:limit]
+
+
+def _reading(line):
+    if b'"rate_limits"' not in line:
+        return None
+    try:
+        rl = json.loads(line).get("payload", {}).get("rate_limits")
+    except (ValueError, AttributeError):
+        return None
+    if not isinstance(rl, dict) or rl.get("limit_id") not in (None, "codex"):
+        return None
+    if not (rl.get("primary") or rl.get("secondary")):
+        return None
+    return rl
+
+
+def last_reading(path, max_scan=MAX_SCAN):
+    """The newest usable rate_limits object in one log, read backwards from the end."""
+    with open(path, "rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        pos = fh.tell()
+        tail = b""
+        scanned = 0
+        while pos > 0 and scanned < max_scan:
+            step = min(CHUNK, pos)
+            pos -= step
+            fh.seek(pos)
+            buf = fh.read(step) + tail
+            scanned += step
+            lines = buf.split(b"\n")
+            tail = lines[0] if pos > 0 else b""  # first piece may be a cut line
+            for line in reversed(lines[1:] if pos > 0 else lines):
+                rl = _reading(line)
+                if rl:
+                    return rl
+    return None
+
+
+def _num(x):
+    """x if it is a finite number (not a bool), else None."""
+    ok = isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+    return x if ok else None
+
+
+def windows(rl, now):
+    """{'5h': {...}, '7d': {...}}: a passed reset counts as 0 % used (and is flagged), a window without a numeric used_percent is dropped."""
+    out = {}
+    for key in ("primary", "secondary"):
+        w = rl.get(key)
+        if not isinstance(w, dict) or _num(w.get("used_percent")) is None:
+            continue
+        minutes = _num(w.get("window_minutes")) or (300 if key == "primary" else 10080)
+        name = "5h" if minutes <= 24 * 60 else "7d"
+        used, resets, passed = float(w["used_percent"]), _num(w.get("resets_at")), False
+        if resets and resets <= now:
+            used, resets, passed = 0.0, None, True
+        out[name] = {"used_percent": used, "left_percent": min(100.0, max(0.0, 100 - used)),
+                     "resets_at": resets, "reset_since_reading": passed}
+    return out
+
+
+def read(home=None, now=None):
+    now = time.time() if now is None else now
+    for path in newest_logs(home or codex_home()):
+        rl = last_reading(path)
+        if rl:
+            w = windows(rl, now)  # a reading with no usable window means the format changed: no guess
+            return {"plan": rl.get("plan_type"), "as_of": os.path.getmtime(path), "windows": w} if w else None
+    return None
+
+
+def _when(ts):
+    return datetime.fromtimestamp(ts).strftime("%a %d %b %H:%M") if ts else "-"
+
+
+def percent(s):
+    v = float(s)
+    if not 0 <= v <= 100:  # also rejects nan
+        raise ValueError(s)
+    return v
+
+
+def main(argv, home=None, now=None):
+    ap = argparse.ArgumentParser(prog="codex-usage", description=__doc__, allow_abbrev=False,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--json", action="store_true", help="print one JSON object")
+    ap.add_argument("--min-left", type=percent, metavar="PERCENT", help="exit 3 if a window has less than PERCENT left")
+    ap.add_argument("--selftest", action="store_true", help="check the parser")
+    a = ap.parse_args(argv)
+    if a.selftest:
+        return selftest()
+    r = read(home, now)
+    if not r:
+        print("codex-usage: no usage reading yet; run one Codex task first", file=sys.stderr)
+        return 1
+    if a.json:
+        print(json.dumps(r))
+    else:
+        plan = f" ({r['plan']})" if r["plan"] else ""
+        print(f"Codex{plan}, as of {_when(r['as_of'])}")
+        for name, w in r["windows"].items():
+            if w["reset_since_reading"]:
+                reset = ", reset since the last reading (assumed unused)"
+            else:
+                reset = f", resets {_when(w['resets_at'])}" if w["resets_at"] else ""
+            print(f"  {name}: {w['left_percent']:.0f}% left{reset}")
+    if a.min_left is not None and any(w["left_percent"] < a.min_left for w in r["windows"].values()):
+        return 3
+    return 0
+
+
+def selftest():
+    import contextlib
+    import io
+    import tempfile
+    now = 1_800_000_000
+    good = {"limit_id": "codex", "plan_type": "plus",
+            "primary": {"used_percent": 25.0, "window_minutes": 300, "resets_at": now + 60},
+            "secondary": {"used_percent": 90.0, "window_minutes": 10080, "resets_at": now - 60}}
+
+    def make_home(*readings, noise=()):
+        home = tempfile.mkdtemp(dir=base)
+        day = os.path.join(home, "sessions", "2026", "11", "21")
+        os.makedirs(day)
+        lines = [json.dumps({"payload": {"type": "token_count", "rate_limits": r}}) for r in readings]
+        with open(os.path.join(day, "rollout-a.jsonl"), "w") as fh:
+            fh.write("\n".join(lines + list(noise)) + "\n")
+        return home, os.path.join(day, "rollout-a.jsonl")
+
+    def run_main(argv, home=None):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                rc = main(argv, home, now)
+            except SystemExit as e:
+                rc = e.code
+        return rc, out.getvalue()
+
+    with tempfile.TemporaryDirectory() as base:
+        empty = tempfile.mkdtemp(dir=base)
+        assert read(empty, now) is None
+        assert run_main([], empty)[0] == 1
+        other = dict(good, limit_id="other-model")
+        home, path = make_home(good, noise=['not json "rate_limits"', json.dumps(
+            {"payload": {"type": "token_count", "rate_limits": other}}), "x" * (3 * CHUNK)])  # pushes the reading across chunk borders
+        r = read(home, now)
+        assert r and r["plan"] == "plus", r
+        assert r["windows"]["5h"]["left_percent"] == 75.0, r
+        assert r["windows"]["7d"] == {"used_percent": 0.0, "left_percent": 100.0, "resets_at": None,
+                                      "reset_since_reading": True}, r
+        assert last_reading(path, max_scan=CHUNK) is None
+        # a passed reset is labelled, and counts as 100 % left for --min-left
+        rc, out = run_main([], home)
+        assert rc == 0 and "7d: 100% left, reset since the last reading (assumed unused)" in out, out
+        assert run_main(["--min-left", "70"], home)[0] == 0
+        assert run_main(["--min-left", "80"], home)[0] == 3
+        assert json.loads(run_main(["--json"], home)[1])["windows"]["7d"]["reset_since_reading"] is True
+        # bad arguments exit 2 and never read anything
+        for bad in (["--bogus"], ["--jsno"], ["--min-left"], ["--min-left", "abc"], ["--min-left", "nan"], ["--min-left", "150"]):
+            assert run_main(bad, home)[0] == 2, bad
+        assert run_main(["--help"], home)[0] == 0
+        # a window without a numeric used_percent is dropped; with none left there is no reading
+        for junk in ("unknown", None, True, float("nan"), "50"):
+            home2, _ = make_home(dict(good, primary=dict(good["primary"], used_percent=junk)))
+            assert list(read(home2, now)["windows"]) == ["7d"], junk
+        home3, _ = make_home(dict(good, primary={"used_percent": "x"}, secondary={"window_minutes": 10080}))
+        assert read(home3, now) is None and run_main(["--min-left", "20"], home3)[0] == 1
+    print("selftest ok")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

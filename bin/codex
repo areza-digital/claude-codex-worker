@@ -1,0 +1,24 @@
+#!/bin/bash
+# Runs the Codex CLI that ships inside the ChatGPT/Codex editor extension
+# (VS Code, Cursor, Windsurf, Antigravity), for machines where Codex is only
+# installed as an extension. It uses the same login (~/.codex). If you install
+# Codex itself (brew install --cask codex, or npm i -g @openai/codex), that copy
+# wins and this file can go.
+self=$(realpath "$0")
+if [ -z "$CODEX_LOCATOR_SEEN" ]; then
+  export CODEX_LOCATOR_SEEN=1  # a second copy of this script skips PATH, so two copies never loop
+  IFS=: read -ra dirs <<< "$PATH"
+  for d in "${dirs[@]}"; do
+    c="$d/codex"
+    if [ -x "$c" ] && [ "$(realpath "$c")" != "$self" ]; then exec "$c" "$@"; fi
+  done
+fi
+best=""
+for root in .vscode .vscode-insiders .cursor .windsurf .antigravity .antigravity-ide; do
+  for ext in "$HOME/$root/extensions"/openai.chatgpt-*; do
+    for c in "$ext"/bin/*/codex; do [ -x "$c" ] && best="$best${ext##*/}"$'\t'"$c"$'\n'; done
+  done
+done
+c=$(printf '%s' "$best" | sort -V | tail -1 | cut -f2)  # newest extension version: each line starts with its folder name, so the folder decides, not the path above it
+[ -n "$c" ] || { echo "codex: no Codex CLI on PATH and no ChatGPT/Codex editor extension found" >&2; exit 127; }
+exec "$c" "$@"
