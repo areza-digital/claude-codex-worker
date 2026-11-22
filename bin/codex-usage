@@ -35,7 +35,7 @@ from datetime import datetime
 
 CHUNK = 64 * 1024
 MAX_SCAN = 8 * 1024 * 1024  # bytes read from the end of one log before giving up on it
-MAX_FILES = 5
+MAX_FILES = 40  # a run refused at the limit logs only "premium" readings with no windows; look past a run of those
 
 
 def codex_home():
